@@ -415,7 +415,7 @@ def click(self, x: int | Box | List[Box] = -1, y=-1, move_back=False, name=None,
     - `interval` (float): 距离上次点击的最小时间间隔（秒）。
     - `move` (bool): 是否在点击前移动鼠标。
     - `down_time` (float): 鼠标按下的持续时间（秒）。
-    - `after_sleep` (float): 点击后等待的时间（秒）；会调用 `sleep`，因此会清空当前缓存帧。
+    - `after_sleep` (float | str): 点击后等待的时间（秒），支持传入 'auto'；会调用 `sleep`，因此会清空当前缓存帧。
     - `key` (str): 要点击的鼠标按键 ('left', 'right', 'middle')。
     - `hcenter`, `vcenter` (bool): 如果点击相对坐标且设为 True，则以屏幕中心为原点。
 - **返回:**
@@ -440,7 +440,7 @@ def click_box(self, box: Box | List[Box] = None, relative_x=0.5, relative_y=0.5,
     - `move_back` (bool): 点击后是否将鼠标移回原位。
     - `move` (bool): 是否在点击前移动鼠标。
     - `down_time` (float): 鼠标按下的持续时间（秒）。
-    - `after_sleep` (float): 点击后等待的时间（秒）；会调用 `sleep`，因此会清空当前缓存帧。
+    - `after_sleep` (float | str): 点击后等待的时间（秒），支持传入 'auto'；会调用 `sleep`，因此会清空当前缓存帧。
 
 <a name="click_box_if_name_match"></a>
 
@@ -661,7 +661,7 @@ def move_relative(self, x, y)
 def back(self, *args, after_sleep=0, **kwargs)
 ```
 
-模拟返回操作，通常是发送 'esc' 键（PC）或返回键（Android）。支持 `after_sleep` 参数。
+模拟返回操作，通常是发送 'esc' 键（PC）或返回键（Android）。支持 `after_sleep` 参数（支持传入 `'auto'` 进行自适应页面稳定等待）。
 
 ### Config 相关
 
@@ -1395,8 +1395,17 @@ def wait_scene(self, scene_type=None, time_out=0, pre_action=None, post_action=N
 def sleep(self, timeout)
 ```
 
-让当前任务休眠指定秒数。调用时会重置场景并清空当前缓存帧；休眠期间会处理脚本暂停和 `sleep_check`。
-如果刚执行了会改变界面的操作，常用 `sleep(0.5)` 等待界面稳定后再读取新的 `frame`；如果使用 `wait_` 开头的方法，则通常不需要在调用前手动 `sleep`。
+让当前任务休眠指定秒数。支持传入 `'auto'` 进行自适应页面稳定等待。调用时会重置场景并清空当前缓存帧；休眠期间会处理脚本暂停和 `sleep_check`。
+
+如果刚执行了会改变界面的操作，常用 `sleep(0.5)` 等待界面稳定后再读取新的 `frame`；也可以使用 `sleep('auto')` 进行自适应稳定等待，避免固定等待。如果使用 `wait_` 开头的方法，则通常不需要在调用前手动 `sleep`。
+
+#### 自适应等待 (Auto Wait) 说明与规范
+
+当传入 `'auto'` 作为 `sleep` 的时间或交互方法的 `after_sleep` 参数时，`ok-script` 会启用自适应等待。算法会主动监测画面像素变动，并在画面稳定后提前退出。
+
+**推荐使用规范：**
+- **替代短延时**：仅推荐用于替代 **5 秒以内** 的固定短 `sleep`（如 `sleep(0.5)`、`sleep(1)`、`sleep(2)`）。
+- **防御性点击/无变动操作**：如果点击某元素后预期画面**完全不会产生任何像素变化**（例如已处于目标页签，再次点击该页签），算法由于存在前置交互，会卡满 1.2 秒的卡顿保护期才会退出。对此类场景，**不要使用 `'auto'`**，应继续沿用固定短延时。
 
 <a name="sleep_check"></a>
 

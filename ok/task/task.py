@@ -6,6 +6,7 @@ from typing import List
 from PySide6.QtCore import QCoreApplication
 
 import cv2
+import numpy as np
 from qfluentwidgets import FluentIcon
 
 from ok.feature.Box import find_boxes_by_name, find_boxes_within_boundary, Box, find_box_by_name, relative_box, \
@@ -48,6 +49,7 @@ class ExecutorOperation:
         self.last_click_time = 0
         self.logger.debug(f'ExecutorOperation init {executor.scene}')
         self.scene = executor.scene
+        self._has_interaction_since_last_stable = False
 
     def validate_key(self, key):
         if isinstance(key, int):
@@ -133,6 +135,144 @@ class ExecutorOperation:
     def reset_scene(self):
         self.executor.reset_scene()
 
+    def _preprocess_frame(self, img, roi=None):
+        if img is None:
+            return None
+
+        if roi is not None:
+            x, y, w, h = (roi.x, roi.y, roi.width, roi.height) if hasattr(roi, 'x') else roi
+            H, W = img.shape[:2]
+            x, y = max(0, min(x, W - 1)), max(0, min(y, H - 1))
+            w, h = max(1, min(w, W - x)), max(1, min(h, H - y))
+            sub_img = img[y:y + h, x:x + w]
+        else:
+            sub_img = img
+
+        gray = cv2.cvtColor(sub_img, cv2.COLOR_BGR2GRAY)
+        sh, sw = gray.shape[:2]
+        if sw <= 0:
+            return gray
+        target_h = max(1, int(sh * 240 / sw))
+        return cv2.resize(gray, (240, target_h), interpolation=cv2.INTER_AREA)
+
+    def calculate_frame_diff(self, frame1, frame2, roi=None):
+        """
+        Calculates the mean absolute difference (MAD) between two frames.
+
+        计算两个影格的均值差异 (Mean Absolute Difference)。
+
+        :param frame1: The first frame (numpy array). 第一个影格。
+        :param frame2: The second frame (numpy array). 第二个影格。
+        :param roi: The region of interest (Box), None for full screen. 感兴趣区域 (Box)。
+        :return: Mean absolute difference (float). 均值差异。
+        """
+        if frame1 is None or frame2 is None:
+            return 255.0
+        # 若两帧已是预处理好的 2D 降采样矩阵则直接计算 absdiff，以利外部优化与防崩溃
+        if len(frame1.shape) == 2 and len(frame2.shape) == 2:
+            if frame1.shape != frame2.shape:
+                return 255.0
+            return float(np.mean(cv2.absdiff(frame1, frame2)))
+        p1 = self._preprocess_frame(frame1, roi)
+        p2 = self._preprocess_frame(frame2, roi)
+        return float(np.mean(cv2.absdiff(p1, p2)))
+
+    def wait_page_stable(self, timeout=5.0, check_interval=0.012, stable_frames=2, roi=None, baseline_frame=None):
+        """
+        Waits until the screen frame is stable.
+
+        等待页面稳定（自适应定格等待算法）。
+        利用 2D 降采样计算当前帧与前一帧的相对运动差值 diff，以及与基准帧的绝对漂移 drift。
+        当有大变动发生时，利用动能与方差比率公式判定画面是否收敛，在稳定时提前退出。
+
+        :param timeout: Maximum wait time. 最大等待时间。
+        :param check_interval: Time interval between checks. 检查间隔时间。
+        :param stable_frames: Consecutive stable frames to confirm stabilization. 确认稳定所需的连续稳定帧数。
+        :param roi: Region of interest to check. 检查的感兴趣区域。
+        :param baseline_frame: Base frame for drift comparison. 漂移对比的基准帧。
+        :return: True if stable, False if timeout. 如果稳定返回 True，超时返回 False。
+        """
+        self.logger.debug("wait_page_stable: Start robust mathematical adaptive stability detection")
+        has_interaction = getattr(self, '_has_interaction_since_last_stable', False)
+        self._has_interaction_since_last_stable = False
+
+        if baseline_frame is None:
+            baseline_frame = self.frame
+            if baseline_frame is None:
+                return False
+
+        # Preprocess baseline frame only once before the loop to eliminate duplicate calculations
+        baseline_prepared = self._preprocess_frame(baseline_frame, roi)
+        if baseline_prepared is None:
+            return False
+
+        # 决定防御窗：若有前置互动，使用完整安全防御窗以抵抗设备卡顿与加载迟滞；若无前置互动则使用 2 帧确认窗以利快速退出
+        if has_interaction:
+            T_shield = min(1.2, timeout * 0.8)
+            N_shield = 4 if check_interval <= 0.005 else max(2, int(T_shield / check_interval))
+        else:
+            N_shield = 2
+
+        max_drift = 0.0
+        max_diff = 0.0
+        drift_history = []
+        diff_history = []
+        
+        start_time = time.time()
+        deadline = start_time + timeout
+        frame_count = 0
+        history_limit = stable_frames + 1
+
+        last_prepared = baseline_prepared
+
+        while time.time() < deadline and not self.exit_is_set():
+            self.sleep(check_interval)
+            curr = self.next_frame()
+            if curr is None:
+                if frame_count >= 3:
+                    return True
+                continue
+
+            frame_count += 1
+            curr_prepared = self._preprocess_frame(curr, roi)
+            if curr_prepared is None:
+                continue
+
+            # Calculate relative motion (diff) and absolute drift (drift)
+            diff = self.calculate_frame_diff(last_prepared, curr_prepared)
+            drift = self.calculate_frame_diff(baseline_prepared, curr_prepared)
+
+            last_prepared = curr_prepared
+            max_diff = max(max_diff, diff)
+            max_drift = max(max_drift, drift)
+
+            drift_history.append(drift)
+            diff_history.append(diff)
+            if len(drift_history) > history_limit:
+                drift_history.pop(0)
+                diff_history.pop(0)
+
+            time_cost = time.time() - start_time
+            if len(drift_history) >= history_limit:
+                if max_drift >= 1.0:
+                    # PVCD-Wait dimensionless adaptive convergence model
+                    K = sum(diff_history[1:]) / stable_frames
+                    var_drift = np.var(drift_history)
+                    Sm = 0.7 * (K / (max_diff + 1e-5)) + 0.3 * (var_drift / (drift + 1e-5))
+                    if Sm < 0.08:
+                        self.logger.debug(f"wait_page_stable: Stabilized (Sm={Sm:.3f}). peak_drift={max_drift:.2f}, curr_drift={drift:.2f}, cost={time_cost:.2f}s")
+                        return True
+                else:
+                    # Early exit if no large motion was ever detected and defense shield window is met
+                    if frame_count > N_shield:
+                        self.logger.debug(f"wait_page_stable: Early Exit (No large motion). peak_drift={max_drift:.2f}, cost={time_cost:.2f}s")
+                        return True
+
+        self.logger.debug(f"wait_page_stable: Timeout or exited. cost={time.time() - start_time:.2f}s")
+        return False
+
+
+
     def click(self, x: int | Box | List[Box] = -1, y=-1, move_back=False, name=None, interval=-1, move=True,
               down_time=0.02, after_sleep=0, key='left', hcenter=False, vcenter=False):
         """
@@ -159,20 +299,32 @@ class ExecutorOperation:
         if not self.check_interval(interval):
             self.executor.reset_scene()
             return False
+
+        # Capture baseline frame before interaction to prevent capture delay
+        baseline = self.frame
+
         communicate.emit_draw_box(f"{key}_click",
                                   [Box(max(0, x - 10), max(0, y - 10), 20, 20, name="click", confidence=-1)],
                                   "green")
+        self._has_interaction_since_last_stable = True
         self.executor.interaction.click(x, y, move_back=move_back, name=name, move=move, down_time=down_time, key=key)
         if name:
             self.logger.info(f'{key}_click {name} {x, y} after_sleep {after_sleep}')
-        if after_sleep > 0:
+        if after_sleep == 'auto':
+            self.wait_page_stable(baseline_frame=baseline)
+        elif isinstance(after_sleep, (int, float)) and after_sleep > 0:
             self.sleep(after_sleep)
         self.executor.reset_scene()
         return True
 
     def back(self, *args, after_sleep=0, **kwargs):
+        # Capture baseline frame before interaction to prevent capture delay
+        baseline = self.frame
+        self._has_interaction_since_last_stable = True
         self.executor.interaction.back(*args, **kwargs)
-        if after_sleep > 0:
+        if after_sleep == 'auto':
+            self.wait_page_stable(baseline_frame=baseline)
+        elif isinstance(after_sleep, (int, float)) and after_sleep > 0:
             self.sleep(after_sleep)
 
     def middle_click(self, *args, **kwargs):
@@ -205,12 +357,14 @@ class ExecutorOperation:
                                   [Box(max(0, x - 10), max(0, y - 10), 20, 20, name="click", confidence=-1)], "green",
                                   frame)
         self.executor.reset_scene()
+        self._has_interaction_since_last_stable = True
         self.executor.interaction.mouse_down(x, y, name=name, key=key)
 
     def mouse_up(self, name=None, key="left"):
         communicate.emit_draw_box("mouse_up",
                                   self.box_of_screen(0.5, 0.5, width=0.01, height=0.01, name="mouse_up", confidence=-1),
                                   "green")
+        self._has_interaction_since_last_stable = True
         self.executor.interaction.mouse_up(key=key)
         self.executor.reset_scene()
 
@@ -234,6 +388,7 @@ class ExecutorOperation:
         name = f"input_text_{text}"
         communicate.emit_draw_box(name, self.box_of_screen(0.5, 0.5, width=0.01, height=0.01, name=name, confidence=-1),
                                   "blue")
+        self._has_interaction_since_last_stable = True
         self.executor.interaction.input_text(text)
 
     @property
@@ -249,6 +404,7 @@ class ExecutorOperation:
             Box(x, y, 10, 10,
                 name="scroll")], "green", frame)
         # ms = int(duration * 1000)
+        self._has_interaction_since_last_stable = True
         self.executor.interaction.scroll(x, y, count)
         self.executor.reset_scene()
         # self.sleep(duration)
@@ -273,6 +429,7 @@ class ExecutorOperation:
                 name="swipe")], "green", frame)
         ms = int(duration * 1000)
         self.executor.reset_scene()
+        self._has_interaction_since_last_stable = True
         self.executor.interaction.swipe(from_x, from_y, to_x, to_y, ms, settle_time=settle_time)
         self.sleep(after_sleep)
 
@@ -452,7 +609,10 @@ class ExecutorOperation:
         :param timeout: Sleep time. 睡眠时间。
         :return: Always True. 总是 True。
         """
-        self.executor.sleep(timeout)
+        if timeout == 'auto':
+            self.wait_page_stable()
+        else:
+            self.executor.sleep(timeout)
         return True
 
     def send_key(self, key, down_time=0.02, interval=-1, after_sleep=0):
@@ -475,8 +635,12 @@ class ExecutorOperation:
                                   [Box(max(0, 0), max(0, 0), 20, 20, name="send_key_" + str(key), confidence=-1)],
                                   "green")
         self.executor.reset_scene()
+        baseline = self.frame
+        self._has_interaction_since_last_stable = True
         self.executor.interaction.send_key(key, down_time)
-        if after_sleep > 0:
+        if after_sleep == 'auto':
+            self.wait_page_stable(baseline_frame=baseline)
+        elif isinstance(after_sleep, (int, float)) and after_sleep > 0:
             self.sleep(after_sleep)
         return True
 
@@ -489,15 +653,23 @@ class ExecutorOperation:
     def send_key_down(self, key, after_sleep=0):
         key = self.validate_key(key)
         self.executor.reset_scene()
+        baseline = self.frame
+        self._has_interaction_since_last_stable = True
         self.executor.interaction.send_key_down(key)
-        if after_sleep > 0:
+        if after_sleep == 'auto':
+            self.wait_page_stable(baseline_frame=baseline)
+        elif isinstance(after_sleep, (int, float)) and after_sleep > 0:
             self.sleep(after_sleep)
 
     def send_key_up(self, key, after_sleep=0):
         key = self.validate_key(key)
         self.executor.reset_scene()
+        baseline = self.frame
+        self._has_interaction_since_last_stable = True
         self.executor.interaction.send_key_up(key)
-        if after_sleep > 0:
+        if after_sleep == 'auto':
+            self.wait_page_stable(baseline_frame=baseline)
+        elif isinstance(after_sleep, (int, float)) and after_sleep > 0:
             self.sleep(after_sleep)
 
     def wait_until(self, condition, time_out=0, pre_action=None, post_action=None, settle_time=-1,
